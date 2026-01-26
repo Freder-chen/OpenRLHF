@@ -811,7 +811,7 @@ class RemoteExperienceMaker:
 
                 if self.advantage_estimator == "reinforce" and args.gamma != 1.0:
                     decay_positions = experience.info.get("decay_positions")
-                    decay_powers = experience.info.get("decay_powers", experience.info.get("decay_pow"))
+                    decay_powers = experience.info.get("decay_powers")
                     experience.returns = self.get_returns_with_decay(
                         reward,
                         experience.action_mask,
