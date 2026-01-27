@@ -482,12 +482,12 @@ class SamplesGenerator:
             info[key] = torch.tensor([value])
 
         return Experience(
+            prompts=[response["prompt"]],
+            labels=[response["label"]],
             sequences=sequences.unsqueeze(0),
             attention_mask=attention_mask.unsqueeze(0),
             action_mask=action_mask.unsqueeze(0),
             rollout_log_probs=rollout_log_probs.unsqueeze(0) if rollout_log_probs is not None else None,
-            prompts=[response["prompt"]],
-            labels=[response["label"]],
             rewards=torch.tensor([reward_val]) if reward_val is not None else None,
             scores=torch.tensor([score_val]) if score_val is not None else None,
             info=info,
@@ -712,8 +712,7 @@ class RemoteExperienceMaker:
             samples.info["kl"] = kl_mean
 
         end_time = time.time()
-        duration = end_time - start_time
-        time_str = str(timedelta(seconds=duration)).split(".")[0]
+        time_str = str(timedelta(seconds=end_time - start_time)).split(".")[0]
         logger.info(f"✨ Experience making completed in {time_str}")
         return samples_list
 
@@ -731,7 +730,7 @@ class RemoteExperienceMaker:
         - experiences: List of Experience
         - rewards: List of rewards
         """
-        args = self.strategy.args
+        args = self.args
 
         # DAPO reward shaping with optional overlong penalty - Apply BEFORE dynamic indices processing
         if args.overlong_buffer_len is not None:
@@ -810,21 +809,16 @@ class RemoteExperienceMaker:
                     args.gamma = 1.0
 
                 if self.advantage_estimator == "reinforce" and args.gamma != 1.0:
-                    decay_positions = experience.info.get("decay_positions")
-                    decay_powers = experience.info.get("decay_powers")
+                    decay_positions = experience.info.pop("decay_positions")
+                    decay_powers = experience.info.pop("decay_powers")
                     experience.returns = self.get_returns_with_decay(
                         reward,
-                        experience.action_mask,
                         args.gamma,
                         decay_positions=decay_positions,
                         decay_powers=decay_powers,
                     )
                 else:
-                    experience.returns = self.get_cumulative_returns(
-                        reward,
-                        experience.action_mask,
-                        args.gamma,
-                    )
+                    experience.returns = self.get_cumulative_returns(reward, args.gamma)
                 experience.advantages = deepcopy(experience.returns)
             else:
                 raise Exception(f"Unkown advantage_estimator {self.advantage_estimator}")
@@ -912,7 +906,6 @@ class RemoteExperienceMaker:
     def get_cumulative_returns(
         self,
         rewards: torch.Tensor,
-        action_mask: torch.Tensor,
         gamma: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -927,14 +920,11 @@ class RemoteExperienceMaker:
         Output:
         - returns: Tensor of shape (batch_size, response_size)
         """
-        response_length = rewards.size(1)
-        returns = torch.zeros_like(rewards)
-        cumulative_return = torch.zeros(rewards.size(0), device=rewards.device)
-
-        assert action_mask is not None, "action_mask is required"
-        rewards = action_mask * rewards
+        batch_size, response_length = rewards.shape
 
         # Calculate returns by accumulating discounted rewards
+        returns = torch.zeros_like(rewards)
+        cumulative_return = torch.zeros(batch_size, device=rewards.device)
         for t in reversed(range(response_length)):
             cumulative_return = rewards[:, t] + gamma * cumulative_return
             returns[:, t] = cumulative_return
@@ -945,74 +935,27 @@ class RemoteExperienceMaker:
     def get_returns_with_decay(
         self,
         rewards: torch.Tensor,
-        action_mask: torch.Tensor,
         gamma: float,
         decay_positions: Optional[torch.Tensor] = None,
         decay_powers: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Function that computes returns from rewards using REINFORCE with sparse per-token decay.
-
-        Input:
-        - rewards: Tensor of shape (batch_size, response_size)
-        - action_mask: Tensor of shape (batch_size, response_size), binary mask
-        - gamma: base discount factor
-        - decay_positions/decay_powers: decay events, tensors of shape (B, E).
-          decay_powers <= 0 is treated as padding and ignored.
-
-        Output:
-        - returns: Tensor of shape (batch_size, response_size)
-        """
         batch_size, response_length = rewards.shape
 
-        # Rewards should already be masked; enforce alignment here to catch upstream errors.
-        assert action_mask is not None, "action_mask is required"
-        mask = action_mask.to(device=rewards.device, dtype=torch.bool)
-        assert (
-            mask.shape == rewards.shape
-        ), f"action_mask shape must match rewards; got {mask.shape} vs {rewards.shape}"
-        assert bool((rewards[~mask] == 0).all()), "rewards must be zero where action_mask == 0."
-
-        # Build per-token discounts (default: no decay -> all ones).
-        if response_length == 0 or decay_positions is None or decay_powers is None:
-            discounts = torch.ones_like(rewards, dtype=rewards.dtype)
-        else:
-            assert isinstance(decay_positions, torch.Tensor), "decay_positions must be a torch.Tensor"
-            assert isinstance(decay_powers, torch.Tensor), "decay_powers must be a torch.Tensor"
-
+        # Default: no decay -> all ones.
+        discounts = torch.ones_like(rewards, dtype=rewards.dtype)
+        if response_length > 0 and decay_positions is not None and decay_powers is not None:
             decay_pos = decay_positions.to(rewards.device).long()
             decay_pow = decay_powers.to(rewards.device).to(rewards.dtype)
-            assert decay_pos.dim() == 2, "decay_positions must be 2D (B, E)"
-            assert decay_pow.dim() == 2, "decay_powers must be 2D (B, E)"
-            assert (
-                decay_pos.shape == decay_pow.shape
-            ), f"decay_positions and decay_powers must have the same shape; got {decay_pos.shape} vs {decay_pow.shape}"
-            assert (
-                decay_pos.shape[0] == batch_size
-            ), f"decay_positions batch size mismatch; expected {batch_size}, got {decay_pos.shape[0]}"
 
-            # Each decay position is expected to be immediately before an action token.
-            assert response_length >= 2, "decay_positions require response_length >= 2."
-            pos_in_range = (decay_pos >= 0) & (decay_pos <= response_length - 2)
-            assert bool(
-                pos_in_range.all()
-            ), f"decay_positions must be within [0, {response_length - 2}] so pos+1 is valid."
-            pos_next = decay_pos + 1
-            aligned = mask.gather(1, pos_next).all()
-            assert bool(
-                aligned
-            ), "decay_positions must be immediately before an action token (action_mask[pos+1] == 1)."
+            valid = decay_pow > 0
+            if valid.any():
+                decay_exp = torch.zeros_like(rewards, dtype=rewards.dtype)
+                decay_exp.scatter_add_(1, decay_pos, decay_pow * valid.to(decay_pow.dtype))
+                base = rewards.new_tensor(float(gamma))
+                # Each decay event adds to the exponent: discount = gamma ** exponent.
+                discounts = torch.pow(base, decay_exp)
 
-            decay_exp = torch.zeros_like(rewards, dtype=rewards.dtype)
-            decay_exp.scatter_add_(
-                1,
-                decay_pos,
-                decay_pow * (decay_pow > 0).to(decay_pow.dtype),
-            )
-            base = rewards.new_tensor(float(gamma))
-            # Each decay event adds to the exponent: discount = gamma ** exponent.
-            discounts = torch.pow(base, decay_exp)
-
+        # Calculate returns by accumulating discounted rewards
         returns = torch.zeros_like(rewards)
         cumulative_return = torch.zeros(batch_size, device=rewards.device, dtype=rewards.dtype)
         for t in reversed(range(response_length)):
